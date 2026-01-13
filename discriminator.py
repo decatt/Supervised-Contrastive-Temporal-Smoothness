@@ -1,115 +1,169 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import autograd
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1, norm: str = "bn"):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False)
-        if norm == "bn":
-            self.norm = nn.BatchNorm2d(out_ch)
-        elif norm == "gn":
-            g = 8 if out_ch % 8 == 0 else 4 if out_ch % 4 == 0 else 1
-            self.norm = nn.GroupNorm(g, out_ch)
-        else:
-            raise ValueError("norm must be 'bn' or 'gn'")
-        self.act = nn.SiLU(inplace=True)
-
-    def forward(self, x):
-        return self.act(self.norm(self.conv(x)))
-
-
-class CNNFeatMapEncoder(nn.Module):
+def ensure_complex(x: torch.Tensor) -> torch.Tensor:
     """
-    [B,C,H,W] -> feature map [B, out_ch, H', W']
+    Accepts:
+      - complex tensor: [B,17,32,48] (dtype complex)
+      - real tensor with last dim=2: [B,17,32,48,2]  (..,0)=real, (..,1)=imag
+    Returns complex tensor [B,17,32,48]
     """
-    def __init__(self, in_ch: int, base: int = 32, out_ch: int = 128, norm: str = "bn"):
+    if torch.is_complex(x):
+        return x
+    if x.dim() == 5 and x.size(-1) == 2:
+        return torch.complex(x[..., 0], x[..., 1])
+    raise ValueError(f"Unsupported input shape/dtype: shape={tuple(x.shape)}, dtype={x.dtype}")
+
+
+def cv_features(xc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    CV feature extraction from complex input xc: [B,17,32,48] (complex)
+
+    Outputs:
+      feat_34ch: [B,34,32,48]  (concat real/imag along '17' -> 34 channels)
+      feat_64ch: [B,17,64,48]  (concat real/imag along '32' -> 64 channels)
+    """
+    xc = ensure_complex(xc)                      # [B,17,32,48] complex
+    xr = xc.real                                 # [B,17,32,48]
+    xi = xc.imag                                 # [B,17,32,48]
+
+    # (1) 34 channels: stack real/imag on the 17-dim -> 34
+    feat_34ch = torch.cat([xr, xi], dim=1)       # [B,34,32,48]
+
+    # (2) 64 channels: stack real/imag on the 32-dim -> 64 (still keeping 17 as "channels")
+    feat_64ch = torch.cat([xr, xi], dim=2)       # [B,17,64,48]
+
+    return feat_34ch, feat_64ch
+
+
+class DiscBranch34(nn.Module):
+    """Input: [B,34,32,48] -> embedding [B,E]"""
+    def __init__(self, emb_dim: int = 256):
         super().__init__()
-        # two downsamples -> H,W roughly /4
         self.net = nn.Sequential(
-            ConvBlock(in_ch, base,        k=3, s=1, p=1, norm=norm),
-            ConvBlock(base, base,         k=3, s=2, p=1, norm=norm),      # /2
-            ConvBlock(base, base * 2,     k=3, s=1, p=1, norm=norm),
-            ConvBlock(base * 2, base * 2, k=3, s=2, p=1, norm=norm),      # /2
-            ConvBlock(base * 2, out_ch,   k=3, s=1, p=1, norm=norm),
+            nn.Conv2d(34, 64, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True),  # 32x48 -> 16x24
+            nn.Conv2d(128, 256, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True), # 16x24 -> 8x12
+            nn.Conv2d(256, 256, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True),
         )
+        self.proj = nn.Linear(256, emb_dim)
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.net(x)                          # [B,256,8,12]
+        h = h.mean(dim=(2, 3))                   # GAP -> [B,256]
+        return self.proj(h)                      # [B,E]
 
 
-class DualViewDiscFeatMap(nn.Module):
-    """
-    Input:  x [B,17,32,48]
-    BranchA: encoder17(x) where C=17
-    BranchB: encoder32(x.permute -> [B,32,17,48]) where C=32
-
-    To fuse: spatially align both feature maps to (Hf,Wf) via AdaptiveAvgPool2d,
-             concat on channel dim, then conv head -> logit [B].
-    """
-    def __init__(
-        self,
-        base: int = 32,
-        feat_ch: int = 128,
-        fuse_hw: tuple[int, int] = (8, 12),
-        norm: str = "bn",
-        dropout: float = 0.1,
-    ):
+class DiscBranch17(nn.Module):
+    """Input: [B,17,64,48] -> embedding [B,E]"""
+    def __init__(self, emb_dim: int = 256):
         super().__init__()
-        self.encoder17 = CNNFeatMapEncoder(in_ch=17, base=base, out_ch=feat_ch, norm=norm)
-        self.encoder32 = CNNFeatMapEncoder(in_ch=32, base=base, out_ch=feat_ch, norm=norm)
+        self.net = nn.Sequential(
+            nn.Conv2d(17, 64, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True),  # 64x48 -> 32x24
+            nn.Conv2d(128, 256, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True), # 32x24 -> 16x12
+            nn.Conv2d(256, 256, 3, 1, 1), nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.proj = nn.Linear(256, emb_dim)
 
-        self.align = nn.AdaptiveAvgPool2d(fuse_hw)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.net(x)                          # [B,256,16,12]
+        h = h.mean(dim=(2, 3))                   # [B,256]
+        return self.proj(h)                      # [B,E]
 
-        # conv head on fused feature map
+
+class CVDiscriminator(nn.Module):
+    """
+    Discriminator output: realness score per sample, shape [B]
+    Input: complex [B,17,32,48]
+    Internally uses two CV feature views:
+      - [B,34,32,48] with 34 as channels
+      - [B,17,64,48] with 17 as channels
+    """
+    def __init__(self, emb_dim: int = 256):
+        super().__init__()
+        self.b34 = DiscBranch34(emb_dim=emb_dim)
+        self.b17 = DiscBranch17(emb_dim=emb_dim)
         self.head = nn.Sequential(
-            nn.Conv2d(feat_ch * 2, feat_ch, kernel_size=1, bias=False),
-            nn.BatchNorm2d(feat_ch) if norm == "bn" else nn.GroupNorm(8 if feat_ch % 8 == 0 else 1, feat_ch),
-            nn.SiLU(inplace=True),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(feat_ch, 1, kernel_size=1)  # [B,1,Hf,Wf]
+            nn.Linear(2 * emb_dim, emb_dim),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(emb_dim, 1),
         )
 
-        self.pool_logit = nn.AdaptiveAvgPool2d((1, 1))  # -> [B,1,1,1]
-
-    def forward(self, x, return_featmaps: bool = False):
-        if x.ndim != 4 or x.shape[1:] != (17, 32, 48):
-            raise ValueError(f"Expected x with shape [B,17,32,48], got {tuple(x.shape)}")
-
-        # A: 17-as-channel
-        f17 = self.encoder17(x)  # [B,feat_ch,h1,w1]
-
-        # B: 32-as-channel (swap 17 and 32)
-        x32 = x.permute(0, 2, 1, 3).contiguous()  # [B,32,17,48]
-        f32 = self.encoder32(x32)                 # [B,feat_ch,h2,w2]
-
-        # align spatial size for fusion
-        f17a = self.align(f17)  # [B,feat_ch,Hf,Wf]
-        f32a = self.align(f32)  # [B,feat_ch,Hf,Wf]
-
-        fused = torch.cat([f17a, f32a], dim=1)  # [B,2*feat_ch,Hf,Wf]
-        logit_map = self.head(fused)            # [B,1,Hf,Wf]
-        logit = self.pool_logit(logit_map).flatten(1).squeeze(1)  # [B]
-
-        if return_featmaps:
-            # return aligned feature maps and logit_map for inspection/visualization
-            return logit, {"f17": f17a, "f32": f32a, "fused": fused, "logit_map": logit_map}
-        return logit
+    def forward(self, xc: torch.Tensor) -> torch.Tensor:
+        f34, f64 = cv_features(xc)                # f34:[B,34,32,48], f64:[B,17,64,48]
+        e1 = self.b34(f34)                        # [B,E]
+        e2 = self.b17(f64)                        # [B,E]
+        y = self.head(torch.cat([e1, e2], dim=1)) # [B,1]
+        return y.squeeze(1)                       # [B]
 
 
-# -------------------- minimal usage example --------------------
+@torch.no_grad()
+def _rand_eps_like(xc: torch.Tensor) -> torch.Tensor:
+    # epsilon is real-valued; broadcast to [B,1,1,1] then multiplies complex fine
+    B = xc.shape[0]
+    return torch.rand(B, 1, 1, 1, device=xc.device, dtype=xc.real.dtype)
+
+
+def gradient_penalty_wgan_gp(D: nn.Module, real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
+    """
+    GP = E[(||∇_{x_hat} D(x_hat)||2 - 1)^2]
+    real/fake: complex [B,17,32,48]
+    """
+    real = ensure_complex(real)
+    fake = ensure_complex(fake)
+
+    eps = _rand_eps_like(real)                   # [B,1,1,1] real
+    x_hat = eps * real + (1.0 - eps) * fake      # complex
+    x_hat = x_hat.requires_grad_(True)
+
+    d_hat = D(x_hat)                             # [B] real
+    grad = autograd.grad(
+        outputs=d_hat.sum(),
+        inputs=x_hat,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]                                         # complex [B,17,32,48]
+
+    # Convert complex grad -> real/imag and compute per-sample L2 norm over all dims.
+    grad_ri = torch.view_as_real(grad)           # [B,17,32,48,2]
+    grad_ri = grad_ri.reshape(grad_ri.size(0), -1)
+    grad_norm = grad_ri.norm(2, dim=1)           # [B]
+    gp = (grad_norm - 1.0).pow(2).mean()
+    return gp
+
+
+def d_loss_wgan_gp(D: nn.Module, y_real: torch.Tensor, y_fake: torch.Tensor, lambda_gp: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Loss: D(fake).mean() - D(real).mean() + lambda * gp
+    Returns: (loss, gp)
+    """
+    d_real = D(y_real)
+    d_fake = D(y_fake)
+    gp = gradient_penalty_wgan_gp(D, y_real, y_fake)
+    loss = d_fake.mean() - d_real.mean() + lambda_gp * gp
+    return loss, gp
+
+
+# ------------------------- minimal usage example -------------------------
 if __name__ == "__main__":
-    B = 4
-    x = torch.randn(B, 17, 32, 48)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    D = CVDiscriminator(emb_dim=256).to(device)
+    optD = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.0, 0.9))
 
-    model = DualViewDiscFeatMap(base=32, feat_ch=128, fuse_hw=(8, 12), norm="bn", dropout=0.1)
-    logit, feats = model(x, return_featmaps=True)  # logit [B], feats dict
+    B = 8
+    # Example complex inputs
+    y_real = torch.randn(B, 17, 32, 48, device=device) + 1j * torch.randn(B, 17, 32, 48, device=device)
+    y_fake = torch.randn(B, 17, 32, 48, device=device) + 1j * torch.randn(B, 17, 32, 48, device=device)
 
-    y = torch.randint(0, 2, (B,)).float()
-    loss = F.binary_cross_entropy_with_logits(logit, y)
-    loss.backward()
+    lambda_gp = 10.0
+    optD.zero_grad(set_to_none=True)
+    lossD, gp = d_loss_wgan_gp(D, y_real, y_fake, lambda_gp=lambda_gp)
+    lossD.backward()
+    optD.step()
 
-    print("logit:", logit.shape, "loss:", float(loss))
-    for k, v in feats.items():
-        print(k, tuple(v.shape))
+    print(f"lossD={lossD.item():.4f}, gp={gp.item():.4f}")
