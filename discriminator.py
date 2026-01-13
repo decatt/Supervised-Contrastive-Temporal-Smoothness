@@ -4,43 +4,38 @@ import torch.nn.functional as F
 from torch import autograd
 
 
-def ensure_complex(x: torch.Tensor) -> torch.Tensor:
+def ensure_ri(x: torch.Tensor) -> torch.Tensor:
     """
+    Real-imag packed real tensor.
     Accepts:
-      - complex tensor: [B,17,32,48] (dtype complex)
-      - real tensor with last dim=2: [B,17,32,48,2]  (..,0)=real, (..,1)=imag
-    Returns complex tensor [B,17,32,48]
+      - [B,17,32,48,2] float (..,0)=real, (..,1)=imag
+      - complex [B,17,32,48] -> converted to [B,17,32,48,2]
+    Returns: [B,17,32,48,2] float
     """
     if torch.is_complex(x):
+        return torch.view_as_real(x)  # [...,2]
+    if x.dim() == 5 and x.size(-1) == 2 and not torch.is_complex(x):
         return x
-    if x.dim() == 5 and x.size(-1) == 2:
-        return torch.complex(x[..., 0], x[..., 1])
     raise ValueError(f"Unsupported input shape/dtype: shape={tuple(x.shape)}, dtype={x.dtype}")
 
 
-def cv_features(xc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def cv_features_from_ri(x_ri: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    CV feature extraction from complex input xc: [B,17,32,48] (complex)
-
+    Input x_ri: [B,17,32,48,2] (real tensor)
     Outputs:
-      feat_34ch: [B,34,32,48]  (concat real/imag along '17' -> 34 channels)
-      feat_64ch: [B,17,64,48]  (concat real/imag along '32' -> 64 channels)
+      feat_34ch: [B,34,32,48]   (34 as channels)
+      feat_64ch: [B,17,64,48]   (64 on the '32' axis)
     """
-    xc = ensure_complex(xc)                      # [B,17,32,48] complex
-    xr = xc.real                                 # [B,17,32,48]
-    xi = xc.imag                                 # [B,17,32,48]
+    x_ri = ensure_ri(x_ri)                     # [B,17,32,48,2]
+    xr = x_ri[..., 0]                          # [B,17,32,48]
+    xi = x_ri[..., 1]                          # [B,17,32,48]
 
-    # (1) 34 channels: stack real/imag on the 17-dim -> 34
-    feat_34ch = torch.cat([xr, xi], dim=1)       # [B,34,32,48]
-
-    # (2) 64 channels: stack real/imag on the 32-dim -> 64 (still keeping 17 as "channels")
-    feat_64ch = torch.cat([xr, xi], dim=2)       # [B,17,64,48]
-
+    feat_34ch = torch.cat([xr, xi], dim=1)     # [B,34,32,48]
+    feat_64ch = torch.cat([xr, xi], dim=2)     # [B,17,64,48]
     return feat_34ch, feat_64ch
 
 
 class DiscBranch34(nn.Module):
-    """Input: [B,34,32,48] -> embedding [B,E]"""
     def __init__(self, emb_dim: int = 256):
         super().__init__()
         self.net = nn.Sequential(
@@ -52,13 +47,12 @@ class DiscBranch34(nn.Module):
         self.proj = nn.Linear(256, emb_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.net(x)                          # [B,256,8,12]
-        h = h.mean(dim=(2, 3))                   # GAP -> [B,256]
-        return self.proj(h)                      # [B,E]
+        h = self.net(x)                         # [B,256,8,12]
+        h = h.mean(dim=(2, 3))                  # [B,256]
+        return self.proj(h)                     # [B,E]
 
 
 class DiscBranch17(nn.Module):
-    """Input: [B,17,64,48] -> embedding [B,E]"""
     def __init__(self, emb_dim: int = 256):
         super().__init__()
         self.net = nn.Sequential(
@@ -70,18 +64,15 @@ class DiscBranch17(nn.Module):
         self.proj = nn.Linear(256, emb_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.net(x)                          # [B,256,16,12]
-        h = h.mean(dim=(2, 3))                   # [B,256]
-        return self.proj(h)                      # [B,E]
+        h = self.net(x)                         # [B,256,16,12]
+        h = h.mean(dim=(2, 3))                  # [B,256]
+        return self.proj(h)                     # [B,E]
 
 
-class CVDiscriminator(nn.Module):
+class CVDiscriminatorRI(nn.Module):
     """
-    Discriminator output: realness score per sample, shape [B]
-    Input: complex [B,17,32,48]
-    Internally uses two CV feature views:
-      - [B,34,32,48] with 34 as channels
-      - [B,17,64,48] with 17 as channels
+    Input: x_ri [B,17,32,48,2] (real tensor, packed real/imag)
+    Output: score [B]
     """
     def __init__(self, emb_dim: int = 256):
         super().__init__()
@@ -93,58 +84,51 @@ class CVDiscriminator(nn.Module):
             nn.Linear(emb_dim, 1),
         )
 
-    def forward(self, xc: torch.Tensor) -> torch.Tensor:
-        f34, f64 = cv_features(xc)                # f34:[B,34,32,48], f64:[B,17,64,48]
-        e1 = self.b34(f34)                        # [B,E]
-        e2 = self.b17(f64)                        # [B,E]
-        y = self.head(torch.cat([e1, e2], dim=1)) # [B,1]
-        return y.squeeze(1)                       # [B]
+    def forward(self, x_ri: torch.Tensor) -> torch.Tensor:
+        f34, f64 = cv_features_from_ri(x_ri)     # [B,34,32,48], [B,17,64,48]
+        e1 = self.b34(f34)
+        e2 = self.b17(f64)
+        y = self.head(torch.cat([e1, e2], dim=1))
+        return y.squeeze(1)
 
 
-@torch.no_grad()
-def _rand_eps_like(xc: torch.Tensor) -> torch.Tensor:
-    # epsilon is real-valued; broadcast to [B,1,1,1] then multiplies complex fine
-    B = xc.shape[0]
-    return torch.rand(B, 1, 1, 1, device=xc.device, dtype=xc.real.dtype)
-
-
-def gradient_penalty_wgan_gp(D: nn.Module, real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
+def gradient_penalty_wgan_gp_real(D: nn.Module, real_ri: torch.Tensor, fake_ri: torch.Tensor) -> torch.Tensor:
     """
     GP = E[(||∇_{x_hat} D(x_hat)||2 - 1)^2]
-    real/fake: complex [B,17,32,48]
+    All in real domain:
+      real_ri, fake_ri: [B,17,32,48,2] float
     """
-    real = ensure_complex(real)
-    fake = ensure_complex(fake)
+    real_ri = ensure_ri(real_ri)
+    fake_ri = ensure_ri(fake_ri)
 
-    eps = _rand_eps_like(real)                   # [B,1,1,1] real
-    x_hat = eps * real + (1.0 - eps) * fake      # complex
+    B = real_ri.size(0)
+    eps = torch.rand(B, 1, 1, 1, 1, device=real_ri.device, dtype=real_ri.dtype)  # broadcast
+    x_hat = eps * real_ri + (1.0 - eps) * fake_ri
     x_hat = x_hat.requires_grad_(True)
 
-    d_hat = D(x_hat)                             # [B] real
+    d_hat = D(x_hat)  # [B]
     grad = autograd.grad(
         outputs=d_hat.sum(),
         inputs=x_hat,
         create_graph=True,
         retain_graph=True,
         only_inputs=True,
-    )[0]                                         # complex [B,17,32,48]
+    )[0]              # [B,17,32,48,2] real
 
-    # Convert complex grad -> real/imag and compute per-sample L2 norm over all dims.
-    grad_ri = torch.view_as_real(grad)           # [B,17,32,48,2]
-    grad_ri = grad_ri.reshape(grad_ri.size(0), -1)
-    grad_norm = grad_ri.norm(2, dim=1)           # [B]
+    grad = grad.reshape(B, -1)
+    grad_norm = grad.norm(2, dim=1)             # [B]
     gp = (grad_norm - 1.0).pow(2).mean()
     return gp
 
 
-def d_loss_wgan_gp(D: nn.Module, y_real: torch.Tensor, y_fake: torch.Tensor, lambda_gp: float) -> tuple[torch.Tensor, torch.Tensor]:
+def d_loss_wgan_gp_real(D: nn.Module, y_real_ri: torch.Tensor, y_fake_ri: torch.Tensor, lambda_gp: float):
     """
-    Loss: D(fake).mean() - D(real).mean() + lambda * gp
-    Returns: (loss, gp)
+    Loss: D(y_fake).mean() - D(y_real).mean() + lambda * gp
+    All inputs are real-packed complex: [B,17,32,48,2]
     """
-    d_real = D(y_real)
-    d_fake = D(y_fake)
-    gp = gradient_penalty_wgan_gp(D, y_real, y_fake)
+    d_real = D(y_real_ri)
+    d_fake = D(y_fake_ri)
+    gp = gradient_penalty_wgan_gp_real(D, y_real_ri, y_fake_ri)
     loss = d_fake.mean() - d_real.mean() + lambda_gp * gp
     return loss, gp
 
@@ -152,17 +136,17 @@ def d_loss_wgan_gp(D: nn.Module, y_real: torch.Tensor, y_fake: torch.Tensor, lam
 # ------------------------- minimal usage example -------------------------
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    D = CVDiscriminator(emb_dim=256).to(device)
+    D = CVDiscriminatorRI(emb_dim=256).to(device)
     optD = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.0, 0.9))
 
     B = 8
-    # Example complex inputs
-    y_real = torch.randn(B, 17, 32, 48, device=device) + 1j * torch.randn(B, 17, 32, 48, device=device)
-    y_fake = torch.randn(B, 17, 32, 48, device=device) + 1j * torch.randn(B, 17, 32, 48, device=device)
+    # real-packed complex: [B,17,32,48,2]
+    y_real_ri = torch.randn(B, 17, 32, 48, 2, device=device)
+    y_fake_ri = torch.randn(B, 17, 32, 48, 2, device=device)
 
     lambda_gp = 10.0
     optD.zero_grad(set_to_none=True)
-    lossD, gp = d_loss_wgan_gp(D, y_real, y_fake, lambda_gp=lambda_gp)
+    lossD, gp = d_loss_wgan_gp_real(D, y_real_ri, y_fake_ri, lambda_gp=lambda_gp)
     lossD.backward()
     optD.step()
 
